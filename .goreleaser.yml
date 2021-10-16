@@ -1,0 +1,58 @@
+#
+# GoReleaser Configuration File
+#
+# Releases can be done from the command line
+#   $ goreleaser check
+#   $ goreleaser build --single-target
+#   $ goreleaser release --snapshot --rm-dist
+#
+# Documentation:
+#   https://goreleaser.com
+#
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version.Version={{.Version}} -X main.version.Revision={{.Commit}} -X main.version.Branch={{.Branch}} -X main.version.BuildDate={{.CommitDate}} -X main.version.BuildUser=goreleaser
+    mod_timestamp: '{{ .CommitTimestamp }}'
+dockers:
+  - image_templates:
+      - ghcr.io/patrickglass/dsql
+    goos: linux
+    goarch: amd64
+    build_flag_templates:
+      - "--pull"
+      - "--label=org.opencontainers.image.source=https://{{.ModulePath}}"
+      - "--label=org.opencontainers.image.created={{.CommitDate}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+      - "--platform=linux/arm64"
+archives:
+  - replacements:
+      darwin: Darwin
+      linux: Linux
+      windows: Windows
+      386: i386
+      amd64: x86_64
+checksum:
+  name_template: 'checksums.txt'
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
