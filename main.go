@@ -17,22 +17,30 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"runtime"
+
+	"github.com/patrickglass/dsql/server"
 
 	"github.com/kelseyhightower/envconfig"
 	"github.com/mattn/go-isatty"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	buildVersion "github.com/prometheus/common/version"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 type Specification struct {
-	Debug       bool
-	Port        int `default:"8080"`
-	MetricsPort int `default:"8080"`
+	Debug           bool
+	DevelopmentMode bool
+	PublicKeyFile   string `default:"./server.pem"`
+	PrivateKeyFile  string `default:"./server.key"`
+	Port            int    `default:"5432"`
+	MetricsPort     int    `default:"5480"`
 }
 
 func init() {
@@ -54,11 +62,42 @@ func configureGlobalLogger() {
 	}
 }
 
-func main() {
-	var s Specification
+func StartServer(s Specification) error {
+	if s.DevelopmentMode && s.PrivateKeyFile == "" && s.PublicKeyFile == "" {
+		log.Fatal().Msg("DSQL_PRIVATEKEY and DSQL_PUBLICKEY must be set unless in Development mode")
+	}
 
-	// Configure logger based on terminal type
-	configureGlobalLogger()
+	// Start the prometheus server
+	http.Handle("/metrics", promhttp.Handler())
+	go http.ListenAndServe(fmt.Sprintf(":%d", s.MetricsPort), nil)
+	log.Info().Int("port", s.MetricsPort).Msg("prometheus metrics started")
+
+	// cert, err := tls.LoadX509KeyPair(s.PublicKeyFile, s.PrivateKeyFile)
+	// if err != nil {
+	// 	log.Fatal().Err(err).Msg("could not parse certificates as PEM files")
+	// }
+	// cfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	// listener, err := tls.Listen("tcp", s.Port, cfg)
+	// if err != nil {
+	// 	log.Fatal().Err(err).Msg("could not start listener")
+	// }
+
+	sqlServer, err := server.New(
+		server.WithPort(s.Port),
+	)
+	if err != nil {
+		log.Fatal().Err(err).Msg("could not start create server")
+	}
+
+	log.Info().Int("port", s.Port).Msg("Starting dsql server")
+	log.Info().Msg("Connect to server with: psql -h localhost -w -c 'select 1'")
+	sqlServer.Listen()
+	return err
+}
+
+func cmdServer() error {
+	var s Specification
 
 	log.Info().
 		Str("version", buildVersion.Version).
@@ -80,9 +119,40 @@ func main() {
 
 	log.Debug().
 		Bool("Debug", s.Debug).
+		Bool("DevelopmentMode", s.DevelopmentMode).
+		Str("PublicKeyFile", s.PublicKeyFile).
+		Str("PrivateKeyFile", s.PrivateKeyFile).
 		Int("Port", s.Port).
 		Int("MetricsPort", s.MetricsPort).
 		Msg("dsql configuration")
 
 	fmt.Println("Hello. Welcome to DSQL")
+	return StartServer(s)
+}
+
+func cmdCertGen() error {
+	pub, priv := server.GenKey()
+	_, _ = pub, priv
+	return nil
+}
+
+func main() {
+	// Configure logger based on terminal type
+	configureGlobalLogger()
+
+	flag.Parse()
+	if flag.NArg() != 1 {
+		log.Fatal().Msg("must specify command as the first argument")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	switch cmd := flag.Arg(0); cmd {
+	case "server":
+		cmdServer()
+	case "gencert":
+		cmdCertGen()
+	default:
+		log.Fatal().Msgf("invalid command: '%s', must be one of 'server' or `gencert`", cmd)
+	}
 }

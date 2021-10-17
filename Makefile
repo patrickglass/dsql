@@ -59,7 +59,7 @@ bench:  ## Run the go benchmark tests.
 .PHONY: run
 run:  ## Run the development server.
 	@echo "INFO: Starting development instance of dsql engine."
-	$(DEVEL_ENV) go run main.go
+	$(DEVEL_ENV) go run main.go server
 
 .PHONY: install
 install:
