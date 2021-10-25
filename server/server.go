@@ -18,12 +18,14 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
-	"os/exec"
+	"sync"
 
 	"github.com/jackc/pgproto3/v2"
+	"github.com/patrickglass/dsql/cowsay"
 	"github.com/rs/zerolog/log"
 )
 
@@ -33,11 +35,14 @@ type Server struct {
 	listener  net.Listener
 	tlsConfig *tls.Config
 	address   string
+	quit      chan interface{}
+	wg        sync.WaitGroup
 }
 
 func New(opts ...Option) (*Server, error) {
 	s := Server{
 		address: ":5432",
+		quit:    make(chan interface{}),
 	}
 	for _, opt := range opts {
 		opt(&s)
@@ -79,35 +84,51 @@ func (s *Server) Serve() error {
 	}
 	s.listener = ln
 
+listenerLoop:
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			// handle error
-			log.Error().Err(err).Msg("connection failure")
-			continue
+			select {
+			case <-s.quit:
+				log.Info().Msg("gracefully exiting sql server")
+				break listenerLoop
+			default:
+				log.Error().Err(err).Msg("connection failure")
+				continue
+			}
 		}
-		go handleConnection(conn)
+		s.wg.Add(1)
+		go func() {
+			handleConnection(conn)
+			s.wg.Done()
+		}()
 	}
+	return nil
+}
 
-	// unreachable: need to fix up error and os signal handling above
+func (s *Server) Shutdown(ctx context.Context) error {
+	close(s.quit)
+	s.listener.Close()
+	s.wg.Wait()
 	return nil
 }
 
 func handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
-	log.Info().Str("address", remoteAddr).Msg("accepted connection")
+	log.Debug().Str("address", remoteAddr).Msg("accepted connection")
 
 	b := NewDataQueryBackend(conn, func(query *pgproto3.Query) ([]byte, error) {
-		// NOTE: VERY DANGEROUS INJECTION CODE, THIS IS FOR TESTING ONLY
-		return exec.Command("sh", "-c", fmt.Sprintf("echo \"%s\" | cowsay -f elephant", query.String)).CombinedOutput()
+
+		say := cowsay.Say("Mooooo, I had a hard time understanding \n\"" + query.String + "\"")
+
+		return []byte(say), nil
 	})
-	go func() {
-		err := b.Run()
-		if err != nil {
-			log.Error().Err(err)
-		}
-		log.Info().Str("address", remoteAddr).Msgf("connection closed")
-	}()
+
+	err := b.Run()
+	if err != nil {
+		log.Error().Err(err)
+	}
+	log.Debug().Str("address", remoteAddr).Msgf("connection closed")
 }
 
 // DataQueryBackend
@@ -143,17 +164,14 @@ func (b *DataQueryBackend) Run() error {
 			return fmt.Errorf("error receiving message: %w", err)
 		}
 
-		switch msg.(type) {
+		switch msg := msg.(type) {
 		case *pgproto3.Query:
-			queryMsg, ok := msg.(*pgproto3.Query)
-			if !ok {
-				return fmt.Errorf("did not receive a query message.")
-			}
-			log.Info().Str("query", queryMsg.String).Msg("sql query")
+			log.Info().Str("query", msg.String).Msg("sql query")
 
 			// Build response
-			response, err := b.responder(queryMsg)
+			response, err := b.responder(msg)
 			if err != nil {
+				log.Error().Err(err).Str("query", msg.String).Msg("response error")
 				return fmt.Errorf("error generating query response: %w", err)
 			}
 

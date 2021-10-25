@@ -17,12 +17,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
+	"sync"
+	"time"
 
 	"github.com/patrickglass/dsql/server"
 
@@ -64,6 +68,8 @@ func configureGlobalLogger() {
 }
 
 func StartServer(s Specification) error {
+	httpServerExitDone := &sync.WaitGroup{}
+
 	if s.DevelopmentMode && s.PrivateKeyFile == "" && s.PublicKeyFile == "" {
 		msg := "DSQL_PRIVATEKEY and DSQL_PUBLICKEY must be set unless in Development mode"
 		log.Fatal().Msg(msg)
@@ -71,8 +77,19 @@ func StartServer(s Specification) error {
 	}
 
 	// Start the prometheus server
-	http.Handle("/metrics", promhttp.Handler())
-	go http.ListenAndServe(fmt.Sprintf(":%d", s.MetricsPort), nil)
+
+	metricsSrv := &http.Server{
+		Addr:    fmt.Sprintf(":%d", s.MetricsPort),
+		Handler: promhttp.Handler(),
+	}
+	httpServerExitDone.Add(1)
+	go func() {
+		defer httpServerExitDone.Done()
+		if err := metricsSrv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Error().Err(err).Msg(err.Error())
+			log.Fatal().Err(err).Msg("could not start metrics listener")
+		}
+	}()
 	log.Info().Int("port", s.MetricsPort).Msg("prometheus metrics started")
 
 	// cert, err := tls.LoadX509KeyPair(s.PublicKeyFile, s.PrivateKeyFile)
@@ -95,8 +112,33 @@ func StartServer(s Specification) error {
 	}
 
 	log.Info().Int("port", s.Port).Msg("Starting dsql server")
-	log.Info().Msg("Connect to server with: psql -h localhost -w -c 'select 1'")
-	err = sqlServer.Serve()
+	log.Info().Msgf("Connect to server with: psql -h localhost -p %d -w -c 'select 1'", s.Port)
+	httpServerExitDone.Add(1)
+	go func() {
+		defer httpServerExitDone.Done()
+		err = sqlServer.Serve()
+		if err != nil {
+			log.Fatal().Err(err).Msg("could not start server")
+		}
+	}()
+
+	// Setting up signal capturing
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+
+	// Waiting for SIGINT (kill -2)
+	<-stop
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sqlServer.Shutdown(ctx); err != nil {
+		log.Error().Err(err).Msg("could not gracefully shutdown sql server")
+	}
+	if err := metricsSrv.Shutdown(ctx); err != nil {
+		log.Error().Err(err).Msg("could not gracefully shutdown metrics server")
+	}
+
+	httpServerExitDone.Wait()
 	return err
 }
 
@@ -145,7 +187,7 @@ func main() {
 
 	flag.Parse()
 	if flag.NArg() != 1 {
-		log.Fatal().Msg("must specify command as the first argument")
+		log.Fatal().Msg("must specify a command as the first argument")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -158,7 +200,11 @@ func main() {
 			os.Exit(1)
 		}
 	case "gencert":
-		cmdCertGen()
+		err := cmdCertGen()
+		if err != nil {
+			log.Error().Err(err).Msgf("certificate generation failed")
+			os.Exit(1)
+		}
 	default:
 		log.Fatal().Msgf("invalid command: '%s', must be one of 'server' or `gencert`", cmd)
 	}
