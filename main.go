@@ -17,6 +17,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -64,7 +65,9 @@ func configureGlobalLogger() {
 
 func StartServer(s Specification) error {
 	if s.DevelopmentMode && s.PrivateKeyFile == "" && s.PublicKeyFile == "" {
-		log.Fatal().Msg("DSQL_PRIVATEKEY and DSQL_PUBLICKEY must be set unless in Development mode")
+		msg := "DSQL_PRIVATEKEY and DSQL_PUBLICKEY must be set unless in Development mode"
+		log.Fatal().Msg(msg)
+		return errors.New(msg)
 	}
 
 	// Start the prometheus server
@@ -87,12 +90,13 @@ func StartServer(s Specification) error {
 		server.WithPort(s.Port),
 	)
 	if err != nil {
-		log.Fatal().Err(err).Msg("could not start create server")
+		log.Error().Err(err).Msg("could not initialize server")
+		return err
 	}
 
 	log.Info().Int("port", s.Port).Msg("Starting dsql server")
 	log.Info().Msg("Connect to server with: psql -h localhost -w -c 'select 1'")
-	sqlServer.Listen()
+	err = sqlServer.Serve()
 	return err
 }
 
@@ -126,7 +130,6 @@ func cmdServer() error {
 		Int("MetricsPort", s.MetricsPort).
 		Msg("dsql configuration")
 
-	fmt.Println("Hello. Welcome to DSQL")
 	return StartServer(s)
 }
 
@@ -149,7 +152,11 @@ func main() {
 
 	switch cmd := flag.Arg(0); cmd {
 	case "server":
-		cmdServer()
+		err := cmdServer()
+		if err != nil {
+			log.Error().Err(err).Msgf("server did not start")
+			os.Exit(1)
+		}
 	case "gencert":
 		cmdCertGen()
 	default:

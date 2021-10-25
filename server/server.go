@@ -65,7 +65,7 @@ func WithTLSCert(s *Server, cert tls.Certificate) Option {
 	}
 }
 
-func (s *Server) Listen() error {
+func (s *Server) Serve() error {
 	var err error
 	var ln net.Listener
 
@@ -79,30 +79,27 @@ func (s *Server) Listen() error {
 	}
 	s.listener = ln
 
-	// Handle connections forever
-	s.HandleConnections()
-
-	// NOTE: this only get called if listener dies
-	return nil
-}
-
-func (s *Server) HandleConnections() {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
 			// handle error
 			log.Error().Err(err).Msg("connection failure")
+			continue
 		}
 		go handleConnection(conn)
 	}
+
+	// unreachable: need to fix up error and os signal handling above
+	return nil
 }
 
 func handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Info().Str("address", remoteAddr).Msg("accepted connection")
 
-	b := NewDataQueryBackend(conn, func() ([]byte, error) {
-		return exec.Command("sh", "-c", "fortune | cowsay -f elephant").CombinedOutput()
+	b := NewDataQueryBackend(conn, func(query *pgproto3.Query) ([]byte, error) {
+		// NOTE: VERY DANGEROUS INJECTION CODE, THIS IS FOR TESTING ONLY
+		return exec.Command("sh", "-c", fmt.Sprintf("echo \"%s\" | cowsay -f elephant", query.String)).CombinedOutput()
 	})
 	go func() {
 		err := b.Run()
@@ -117,10 +114,10 @@ func handleConnection(conn net.Conn) {
 type DataQueryBackend struct {
 	backend   *pgproto3.Backend
 	conn      net.Conn
-	responder func() ([]byte, error)
+	responder func(*pgproto3.Query) ([]byte, error)
 }
 
-func NewDataQueryBackend(conn net.Conn, responder func() ([]byte, error)) *DataQueryBackend {
+func NewDataQueryBackend(conn net.Conn, responder func(*pgproto3.Query) ([]byte, error)) *DataQueryBackend {
 	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
 
 	connHandler := &DataQueryBackend{
@@ -148,7 +145,14 @@ func (b *DataQueryBackend) Run() error {
 
 		switch msg.(type) {
 		case *pgproto3.Query:
-			response, err := b.responder()
+			queryMsg, ok := msg.(*pgproto3.Query)
+			if !ok {
+				return fmt.Errorf("did not receive a query message.")
+			}
+			log.Info().Str("query", queryMsg.String).Msg("sql query")
+
+			// Build response
+			response, err := b.responder(queryMsg)
 			if err != nil {
 				return fmt.Errorf("error generating query response: %w", err)
 			}
@@ -165,7 +169,11 @@ func (b *DataQueryBackend) Run() error {
 				},
 			}}).Encode(nil)
 			buf = (&pgproto3.DataRow{Values: [][]byte{response}}).Encode(buf)
-			buf = (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(buf)
+			// Comand Tag should be the command which is executed for non selects
+			// Insert 0 1
+			// Update 1
+			// Delete 1
+			buf = (&pgproto3.CommandComplete{CommandTag: []byte("")}).Encode(buf)
 			buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 			_, err = b.conn.Write(buf)
 			if err != nil {
