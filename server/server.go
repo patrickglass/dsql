@@ -22,10 +22,10 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"reflect"
 	"sync"
 
 	"github.com/jackc/pgproto3/v2"
-	"github.com/patrickglass/dsql/cowsay"
 	"github.com/rs/zerolog/log"
 )
 
@@ -37,6 +37,9 @@ type Server struct {
 	address   string
 	quit      chan interface{}
 	wg        sync.WaitGroup
+
+	backend  string
+	tenantID string
 }
 
 func New(opts ...Option) (*Server, error) {
@@ -54,6 +57,18 @@ func New(opts ...Option) (*Server, error) {
 func WithAddress(address string) Option {
 	return func(s *Server) {
 		s.address = address
+	}
+}
+
+func WithQueryServiceBackend(hostname string) Option {
+	return func(s *Server) {
+		s.backend = hostname
+	}
+}
+
+func WithTenant(tenant string) Option {
+	return func(s *Server) {
+		s.tenantID = tenant
 	}
 }
 
@@ -99,7 +114,7 @@ listenerLoop:
 		}
 		s.wg.Add(1)
 		go func() {
-			handleConnection(conn)
+			handleConnection(conn, s)
 			s.wg.Done()
 		}()
 	}
@@ -113,15 +128,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, s *Server) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Debug().Str("address", remoteAddr).Msg("accepted connection")
 
-	b := NewDataQueryBackend(conn, func(query *pgproto3.Query) ([]byte, error) {
+	b := NewDataQueryBackend(conn, func(query *pgproto3.Query) (QueryResponse, error) {
 
-		say := cowsay.Say("Mooooo, I had a hard time understanding \n\"" + query.String + "\"")
-
-		return []byte(say), nil
+		resp := FetchMetrics(query.String, s.backend, s.tenantID)
+		return resp, nil
 	})
 
 	err := b.Run()
@@ -135,10 +149,10 @@ func handleConnection(conn net.Conn) {
 type DataQueryBackend struct {
 	backend   *pgproto3.Backend
 	conn      net.Conn
-	responder func(*pgproto3.Query) ([]byte, error)
+	responder func(*pgproto3.Query) (QueryResponse, error)
 }
 
-func NewDataQueryBackend(conn net.Conn, responder func(*pgproto3.Query) ([]byte, error)) *DataQueryBackend {
+func NewDataQueryBackend(conn net.Conn, responder func(*pgproto3.Query) (QueryResponse, error)) *DataQueryBackend {
 	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
 
 	connHandler := &DataQueryBackend{
@@ -175,23 +189,45 @@ func (b *DataQueryBackend) Run() error {
 				return fmt.Errorf("error generating query response: %w", err)
 			}
 
-			buf := (&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
-				{
-					Name:                 []byte("fortune"),
+			fields := []pgproto3.FieldDescription{}
+			for _, field := range response.Headers {
+				fields = append(fields, pgproto3.FieldDescription{
+					Name:                 []byte(field),
 					TableOID:             0,
 					TableAttributeNumber: 0,
 					DataTypeOID:          25,
 					DataTypeSize:         -1,
 					TypeModifier:         -1,
 					Format:               0,
-				},
-			}}).Encode(nil)
-			buf = (&pgproto3.DataRow{Values: [][]byte{response}}).Encode(buf)
+				})
+			}
+			buf := (&pgproto3.RowDescription{Fields: fields}).Encode(nil)
+
+			for _, row := range response.Rows {
+				rowData := make([][]byte, len(row))
+				for i, col := range row {
+					switch value := col.(type) {
+					case nil:
+						rowData[i] = []byte("NULL")
+					case string:
+						rowData[i] = []byte(value)
+					case int:
+						rowData[i] = []byte(fmt.Sprintf("%d", value))
+					case float64:
+						rowData[i] = []byte(fmt.Sprintf("%f", value))
+					default:
+						fmt.Printf("Unknown Data Type %T!\n", value)
+						rowData[i] = []byte("UNKNOWN")
+					}
+				}
+				buf = append(buf, (&pgproto3.DataRow{Values: rowData}).Encode(nil)...)
+			}
+
 			// Comand Tag should be the command which is executed for non selects
 			// Insert 0 1
 			// Update 1
 			// Delete 1
-			buf = (&pgproto3.CommandComplete{CommandTag: []byte("")}).Encode(buf)
+			buf = (&pgproto3.CommandComplete{CommandTag: []byte("SELECT")}).Encode(buf)
 			buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 			_, err = b.conn.Write(buf)
 			if err != nil {
@@ -213,6 +249,7 @@ func (p *DataQueryBackend) handleStartup() error {
 
 	switch startupMessage.(type) {
 	case *pgproto3.StartupMessage:
+		log.Debug().Msg("send startup message")
 		// Do not require auth
 		buf := (&pgproto3.AuthenticationOk{}).Encode(nil)
 		// Indicate backend is Idle and able to accept queries
@@ -222,12 +259,14 @@ func (p *DataQueryBackend) handleStartup() error {
 			return fmt.Errorf("error sending ready for query: %w", err)
 		}
 	case *pgproto3.SSLRequest:
+		log.Debug().Msg("deny request to use SSL")
 		_, err = p.conn.Write([]byte("N"))
 		if err != nil {
 			return fmt.Errorf("error sending deny SSL request: %w", err)
 		}
 		return p.handleStartup()
 	default:
+		log.Info().Str("message", reflect.TypeOf(startupMessage).String()).Msg("unknown startup message")
 		return fmt.Errorf("unknown startup message: %#v", startupMessage)
 	}
 

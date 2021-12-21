@@ -46,6 +46,8 @@ type Specification struct {
 	PrivateKeyFile  string `default:"./server.key"`
 	Port            int    `default:"5432"`
 	MetricsPort     int    `default:"5480"`
+	BackendHost     string `default:"localhost:7777"`
+	TenantID        string `default:"9f13e632-b10b-4ab9-a70e-c7ff11a4f9b1"`
 }
 
 func init() {
@@ -105,6 +107,8 @@ func StartServer(s Specification) error {
 
 	sqlServer, err := server.New(
 		server.WithPort(s.Port),
+		server.WithQueryServiceBackend(s.BackendHost),
+		server.WithTenant(s.TenantID),
 	)
 	if err != nil {
 		log.Error().Err(err).Msg("could not initialize server")
@@ -170,6 +174,8 @@ func cmdServer() error {
 		Str("PrivateKeyFile", s.PrivateKeyFile).
 		Int("Port", s.Port).
 		Int("MetricsPort", s.MetricsPort).
+		Str("BackendHost", s.BackendHost).
+		Str("TenantID", s.TenantID).
 		Msg("dsql configuration")
 
 	return StartServer(s)
