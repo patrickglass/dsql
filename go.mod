@@ -6,7 +6,7 @@ require (
 	github.com/jackc/pgproto3/v2 v2.1.1
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/mattn/go-isatty v0.0.14
-	github.com/prometheus/client_golang v1.11.0
+	github.com/prometheus/client_golang v1.11.1
 	github.com/prometheus/common v0.32.1
 	github.com/rs/zerolog v1.25.0
 	github.com/stretchr/testify v1.7.0
